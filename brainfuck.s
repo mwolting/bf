@@ -2,6 +2,10 @@
 arg_error:      .asciz "USAGE: brainfuck <filename>\n"
 dbgstr: .asciz "%d\n"
 
+.set OUTPUT_BUFFER_SIZE, 65536
+.lcomm output_buffer, OUTPUT_BUFFER_SIZE
+.lcomm output_length, 8
+
 .global main
 main:
         #Set up the stack
@@ -32,6 +36,7 @@ main:
 call_code:
         call *%r10
 
+        call flush_output       #Write out whatever the program left buffered
         movq $0, %rdi
         call exit
 
@@ -68,7 +73,7 @@ compile_brainfuck:
 
         ##Allocate a block of memory to emit code to
         movq $0, %rdi
-        shl $4, %rsi            #Allocate 8 bytes per character for instructions
+        shl $5, %rsi            #Allocate 32 bytes per character for instructions
         movq $3, %rdx         #PROT_READ | PROT_WRITE
         movq $0x22, %rcx
         movq $-1, %r8
@@ -256,20 +261,47 @@ bf_parse_end:
 
 #Calls the SYS_READ syscall to read a single byte from STDIN
 my_getchar:
+        pushq %rdi              #Keep the cell address across the flush
+        call flush_output       #Make sure any prompt is visible before blocking
+        popq %rsi               #read buffer
         movq $1, %rdx           #read length
-        movq %rdi, %rsi         #read buffer
         movq $0, %rax           #syscall no. (SYS_READ)
         movq $0, %rdi           #file no. (STDIN)
         syscall
         ret
 
-#Calls the SYS_WRITE syscall to write a single byte to STDOUT
+#Appends the byte at the address in %rdi to the output buffer, flushing it
+#once it is full. Generated code only keeps state in %r12 and %r13, so like
+#my_getchar this is free to clobber %rax, %rcx, %rdx, %rsi, %rdi and %r11
+#(the syscall instruction itself clobbers %rcx and %r11).
 my_putchar:
-        movq $1, %rdx           #write length
-        movq %rdi, %rsi         #write buffer
+        movb (%rdi), %al
+        movq output_length, %rdx
+        movb %al, output_buffer(%rdx)
+        incq %rdx
+        movq %rdx, output_length
+        cmpq $OUTPUT_BUFFER_SIZE, %rdx
+        je flush_output
+        ret
+
+#Calls the SYS_WRITE syscall until the output buffer has been written to STDOUT.
+#If a write fails the remaining output is dropped, as there is nowhere to report it
+flush_output:
+        movq $output_buffer, %rsi #write buffer
+        movq output_length, %rdx  #write length
+        movq $0, output_length
+flush_output_loop:
+        testq %rdx, %rdx
+        jz flush_output_end     #Nothing (left) to write
         movq $1, %rax           #syscall no. (SYS_WRITE)
         movq $1, %rdi           #file no. (STDOUT)
         syscall
+        testq %rax, %rax
+        jle flush_output_end    #Write failed
+        addq %rax, %rsi         #A write can be partial, so skip what got written
+        subq %rax, %rdx
+        jmp flush_output_loop
+flush_output_end:
         ret
 
 #Reads the file from the passed filename into memory
@@ -288,7 +320,7 @@ read_file:
         syscall
 
         pushq %rax              #Store file descriptor for later use
-        movq $64, %rdi
+        movq $144, %rdi
         call malloc             #Allocate a 64 byte buffer for file stats
         popq %rdi               #Load the file descriptor into rdi
         pushq %rdi              #Store it again for later use
