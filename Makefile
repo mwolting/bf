@@ -1,4 +1,4 @@
 all: ./brainfuck
 
 ./brainfuck: ./brainfuck.s
-	gcc $< -o $@
+	gcc -no-pie $< -o $@
