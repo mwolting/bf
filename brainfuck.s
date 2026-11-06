@@ -46,6 +46,7 @@ wrong_args:
 ## r13: Source index
 ## r14: Target address
 ## r15: Various temporary things
+## r8: Pending pointer offset (pointer movement not yet emitted as code)
 ##
 ## Returns pointer to function that takes one param:
 ##      rdi: base address of brainfuck heap
@@ -68,7 +69,7 @@ compile_brainfuck:
 
         ##Allocate a block of memory to emit code to
         movq $0, %rdi
-        shl $4, %rsi            #Allocate 8 bytes per character for instructions
+        shl $5, %rsi            #Allocate 32 bytes per character for instructions
         movq $3, %rdx         #PROT_READ | PROT_WRITE
         movq $0x22, %rcx
         movq $-1, %r8
@@ -77,6 +78,7 @@ compile_brainfuck:
 
         movq %rax, %r14         #Set up the target address
         pushq %r14
+        movq $0, %r8            #No pointer movement pending yet
 bf_emit_prelude:                #Emits the function prelude
         movq $-443987883 , (%r14) #pushq %rbp - movq %rsp, %rbp
         addq $4, %r14
@@ -112,8 +114,10 @@ bf_parse_loop_switch:
         jmp bf_parse_loop
 
 bf_put_char:
-        movq $0x2C3C8D43, (%r14) #leaq (%12, %13, 1), %rdi
-        addq $4, %r14
+        movw $0x8D43, (%r14)    #leaq disp(%12, %13, 1), %rdi
+        addq $2, %r14
+        movb $0x3C, %al
+        call bf_emit_cell_operand
         movq $0xBA49, (%r14)    #movq $my_putchar, %r10
         addq $2, %r14
         movq $my_putchar, (%r14)
@@ -123,8 +127,10 @@ bf_put_char:
         incq %r13
         jmp bf_parse_loop
 bf_get_char:
-        movq $0x2C3C8D43, (%r14) #leaq (%12, %13, 1), %rdi
-        addq $4, %r14
+        movw $0x8D43, (%r14)    #leaq disp(%12, %13, 1), %rdi
+        addq $2, %r14
+        movb $0x3C, %al
+        call bf_emit_cell_operand
         movq $0xBA49, (%r14)    #movq $my_getchar, %r10
         addq $2, %r14
         movq $my_getchar, (%r14)
@@ -154,8 +160,10 @@ bf_not_incr:
 bf_incrdecr_end:
         cmpb $0, %r15b
         je bf_parse_loop_switch #If it adds up to 0 do nothing
-        movq $0x2c048043, (%r14) #addb ${%r15b}, (%r12, %r13, 1)
-        addq $4, %r14
+        movw $0x8043, (%r14)    #addb ${%r15b}, disp(%r12, %r13, 1)
+        addq $2, %r14
+        movb $0x04, %al
+        call bf_emit_cell_operand
         movb %r15b, (%r14)      #Actual immediate value for previous instruction
         incq %r14
         jmp bf_parse_loop_switch #Parse the next command
@@ -166,11 +174,16 @@ bf_zero_pattern:
         cmpw $0x5d2d, 1(%r12, %r13, 1)
         jne bf_zero_pattern_end
 bf_yes:
-        movq $0x002c04c643, (%r14) #movq $0, (%r12, %r13, 1)
-        addq $5, %r14
+        movw $0xc643, (%r14)    #movb $0, disp(%r12, %r13, 1)
+        addq $2, %r14
+        movb $0x04, %al
+        call bf_emit_cell_operand
+        movb $0, (%r14)         #Actual immediate value for previous instruction
+        incq %r14
         addq $3, %r13
         jmp bf_parse_loop
 bf_zero_pattern_end:
+        call bf_flush_offset    #The loop needs %r13 to point at the actual cell
         pushq %r14
         movq $0x2C3C8043, (%r14) #cmpb $0, (%r12, %r13, 1)
         addq $5, %r14
@@ -180,6 +193,7 @@ bf_zero_pattern_end:
         incq %r13
         jmp bf_parse_loop
 bf_loop_end:
+        call bf_flush_offset    #Every iteration has to end at the same cell
         movq $0x2c3c8043, (%r14) #cmpb $0, (%r12, %r13, 1)
         addq $5, %r14
         movq $0x850f, (%r14)    #jne begin
@@ -214,13 +228,49 @@ bf_not_prev:
         incq %r15               #Increase jump distance
         jmp bf_prevnext
 bf_prevnext_end:
-        cmpq $0, %r15
-        je bf_parse_loop_switch         #If it adds up to 0, do nothing
-        movq $0xc58149, (%r14)            #addq ${%r15}, %r13
-        addq $3, %r14
-        movq %r15, (%r14)               #Write actual immediate value
-        addq $4, %r14
+        addq %r15, %r8                  #Defer the movement until it is needed
         jmp bf_parse_loop_switch
+
+## Emits addq ${%r8}, %r13 if pointer movement is pending, and clears it
+bf_flush_offset:
+        cmpq $0, %r8
+        je bf_flush_offset_end          #If nothing is pending, do nothing
+        movq $0xc58149, (%r14)            #addq ${%r8}, %r13
+        addq $3, %r14
+        movl %r8d, (%r14)               #Write actual immediate value
+        addq $4, %r14
+        movq $0, %r8
+bf_flush_offset_end:
+        ret
+
+## Emits the ModRM, SIB and displacement bytes for the memory operand
+## disp(%r12, %r13, 1), using the pending pointer offset (%r8) as disp
+## al: ModRM byte with mod=00 (only the reg field set by the caller)
+bf_emit_cell_operand:
+        cmpq $0, %r8
+        jne bf_emit_cell_disp8
+        movb %al, (%r14)                #No displacement
+        movb $0x2c, 1(%r14)             #SIB: (%r12, %r13, 1)
+        addq $2, %r14
+        ret
+bf_emit_cell_disp8:
+        cmpq $127, %r8
+        jg bf_emit_cell_disp32          #Doesn't fit in a signed byte
+        cmpq $-128, %r8
+        jl bf_emit_cell_disp32          #Doesn't fit in a signed byte
+        orb $0x40, %al                  #mod=01: 8-bit displacement
+        movb %al, (%r14)
+        movb $0x2c, 1(%r14)             #SIB: (%r12, %r13, 1)
+        movb %r8b, 2(%r14)
+        addq $3, %r14
+        ret
+bf_emit_cell_disp32:
+        orb $0x80, %al                  #mod=10: 32-bit displacement
+        movb %al, (%r14)
+        movb $0x2c, 1(%r14)             #SIB: (%r12, %r13, 1)
+        movl %r8d, 2(%r14)
+        addq $6, %r14
+        ret
 
 bf_parse_end:
         movq $0x5c415d41, (%r14) #popq %r13 - popq %r12
