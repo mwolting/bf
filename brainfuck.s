@@ -46,6 +46,8 @@ wrong_args:
 ## r13: Source index
 ## r14: Target address
 ## r15: Various temporary things
+## rbx: Pending heap pointer offset (pointer moves not yet applied to the
+##      generated code's %r13; cell accesses use it as a displacement)
 ##
 ## Returns pointer to function that takes one param:
 ##      rdi: base address of brainfuck heap
@@ -62,6 +64,8 @@ compile_brainfuck:
         pushq %r12
         pushq %r13
         pushq %r14
+        pushq %rbx
+        subq $8, %rsp           #Keep the stack 16-byte aligned
 
         movq %rdi, %r12         #Set up the source address
         movq $0, %r13           #Set up the source index
@@ -86,6 +90,7 @@ bf_emit_prelude:                #Emits the function prelude
         addq $3, %r14
         movq $0xbd49, (%r14)    #movq $0, %r13
         addq $10, %r14
+        xorq %rbx, %rbx         #No pending pointer offset yet
 bf_parse_loop:                  #Parses the brainfuck source
         movb (%r12, %r13), %dil #Load the next source character
 bf_parse_loop_switch:
@@ -112,6 +117,7 @@ bf_parse_loop_switch:
         jmp bf_parse_loop
 
 bf_put_char:
+        call bf_flush_offset
         movq $0x2C3C8D43, (%r14) #leaq (%12, %13, 1), %rdi
         addq $4, %r14
         movq $0xBA49, (%r14)    #movq $my_putchar, %r10
@@ -123,6 +129,7 @@ bf_put_char:
         incq %r13
         jmp bf_parse_loop
 bf_get_char:
+        call bf_flush_offset
         movq $0x2C3C8D43, (%r14) #leaq (%12, %13, 1), %rdi
         addq $4, %r14
         movq $0xBA49, (%r14)    #movq $my_getchar, %r10
@@ -154,8 +161,9 @@ bf_not_incr:
 bf_incrdecr_end:
         cmpb $0, %r15b
         je bf_parse_loop_switch #If it adds up to 0 do nothing
-        movq $0x2c048043, (%r14) #addb ${%r15b}, (%r12, %r13, 1)
-        addq $4, %r14
+        movw $0x8043, (%r14)    #addb ${%r15b}, {%rbx}(%r12, %r13, 1)
+        addq $2, %r14
+        call bf_emit_cell_operand
         movb %r15b, (%r14)      #Actual immediate value for previous instruction
         incq %r14
         jmp bf_parse_loop_switch #Parse the next command
@@ -166,11 +174,91 @@ bf_zero_pattern:
         cmpw $0x5d2d, 1(%r12, %r13, 1)
         jne bf_zero_pattern_end
 bf_yes:
-        movq $0x002c04c643, (%r14) #movq $0, (%r12, %r13, 1)
-        addq $5, %r14
+        movw $0xc643, (%r14)    #movb $0, {%rbx}(%r12, %r13, 1)
+        addq $2, %r14
+        call bf_emit_cell_operand
+        movb $0, (%r14)         #Immediate value
+        incq %r14
         addq $3, %r13
         jmp bf_parse_loop
 bf_zero_pattern_end:
+bf_scan_pattern:
+        #If the loop body only moves the pointer (e.g. [>>>>]), emit a
+        #dedicated scan for the next zero cell at that stride
+        movq %r13, %rcx         #Lookahead source index
+        xorq %rdx, %rdx         #Net stride of the loop body
+bf_scan_next:
+        incq %rcx
+        movb (%r12, %rcx, 1), %al
+        cmpb $62, %al           #>
+        jne bf_scan_not_next
+        incq %rdx
+        jmp bf_scan_next
+bf_scan_not_next:
+        cmpb $60, %al           #<
+        jne bf_scan_not_prev
+        decq %rdx
+        jmp bf_scan_next
+bf_scan_not_prev:
+        cmpb $93, %al           #] ends the candidate scan loop
+        je bf_scan_found
+        cmpb $0, %al            #Any other command means it's not a scan loop
+        je bf_scan_pattern_end
+        cmpb $43, %al
+        je bf_scan_pattern_end
+        cmpb $45, %al
+        je bf_scan_pattern_end
+        cmpb $46, %al
+        je bf_scan_pattern_end
+        cmpb $44, %al
+        je bf_scan_pattern_end
+        cmpb $91, %al
+        je bf_scan_pattern_end
+        jmp bf_scan_next        #Skip comment characters
+bf_scan_found:
+        cmpq $0, %rdx           #A zero stride would loop forever, use a normal loop
+        je bf_scan_pattern_end
+        call bf_flush_offset
+        #    cmpb $0, (%r12, %r13, 1)
+        #    je done
+        #top:
+        #    addq $stride, %r13
+        #    cmpb $0, (%r12, %r13, 1)
+        #    jne top
+        #done:
+        movq $0x2c3c8043, (%r14) #cmpb $0, (%r12, %r13, 1)
+        addq $5, %r14
+        movb $0x74, (%r14)      #je rel8 (done)
+        leaq 1(%r14), %r15      #Address of the je offset, patched below
+        addq $2, %r14
+        movsbq %dl, %rax
+        cmpq %rdx, %rax         #Does the stride fit in a signed byte?
+        jne bf_scan_stride32
+        movl $0xc58349, (%r14)  #addq ${%dl}, %r13
+        movb %dl, 3(%r14)
+        addq $4, %r14
+        jmp bf_scan_stride_end
+bf_scan_stride32:
+        movl $0xc58149, (%r14)  #addq ${%edx}, %r13
+        movl %edx, 3(%r14)
+        addq $7, %r14
+bf_scan_stride_end:
+        movq $0x2c3c8043, (%r14) #cmpb $0, (%r12, %r13, 1)
+        addq $5, %r14
+        movb $0x75, (%r14)      #jne rel8 (top)
+        leaq 1(%r15), %rax      #Address of top
+        subq %r14, %rax
+        subq $2, %rax           #Offset relative to the end of the jne
+        movb %al, 1(%r14)
+        addq $2, %r14
+        movq %r14, %rax
+        subq %r15, %rax
+        decq %rax               #Offset of done relative to the end of the je
+        movb %al, (%r15)
+        leaq 1(%rcx), %r13      #Continue parsing after the ]
+        jmp bf_parse_loop
+bf_scan_pattern_end:
+        call bf_flush_offset    #The loop condition needs the actual pointer
         pushq %r14
         movq $0x2C3C8043, (%r14) #cmpb $0, (%r12, %r13, 1)
         addq $5, %r14
@@ -180,6 +268,7 @@ bf_zero_pattern_end:
         incq %r13
         jmp bf_parse_loop
 bf_loop_end:
+        call bf_flush_offset
         movq $0x2c3c8043, (%r14) #cmpb $0, (%r12, %r13, 1)
         addq $5, %r14
         movq $0x850f, (%r14)    #jne begin
@@ -214,15 +303,11 @@ bf_not_prev:
         incq %r15               #Increase jump distance
         jmp bf_prevnext
 bf_prevnext_end:
-        cmpq $0, %r15
-        je bf_parse_loop_switch         #If it adds up to 0, do nothing
-        movq $0xc58149, (%r14)            #addq ${%r15}, %r13
-        addq $3, %r14
-        movq %r15, (%r14)               #Write actual immediate value
-        addq $4, %r14
+        addq %r15, %rbx                 #Defer the move until the pointer is needed
         jmp bf_parse_loop_switch
 
 bf_parse_end:
+        call bf_flush_offset
         movq $0x5c415d41, (%r14) #popq %r13 - popq %r12
         addq $4, %r14
         movq $0x5de58b48, (%r14) #movq %rbp, %rsp - popq %rbp
@@ -243,6 +328,8 @@ bf_parse_end:
         popq %rdx
 
         #Restore temporary registers
+        addq $8, %rsp
+        popq %rbx
         popq %r14
         popq %r13
         popq %r12
@@ -252,6 +339,50 @@ bf_parse_end:
         #Pop the stack pointer
         movq %rbp, %rsp
         popq %rbp
+        ret
+
+#Emits the pending pointer offset (%rbx) as addq ${%rbx}, %r13 and clears it.
+#Clobbers %rax only.
+bf_flush_offset:
+        cmpq $0, %rbx
+        je bf_flush_offset_end
+        movsbq %bl, %rax
+        cmpq %rbx, %rax         #Does the offset fit in a signed byte?
+        jne bf_flush_offset32
+        movl $0xc58349, (%r14)  #addq ${%bl}, %r13
+        movb %bl, 3(%r14)
+        addq $4, %r14
+        xorq %rbx, %rbx
+        ret
+bf_flush_offset32:
+        movl $0xc58149, (%r14)  #addq ${%ebx}, %r13
+        movl %ebx, 3(%r14)
+        addq $7, %r14
+        xorq %rbx, %rbx
+bf_flush_offset_end:
+        ret
+
+#Emits the ModRM, SIB and displacement bytes for the memory operand
+#{%rbx}(%r12, %r13, 1), using the shortest displacement for the pending
+#pointer offset. The emitted ModRM reg field is 0. Clobbers %rax only.
+bf_emit_cell_operand:
+        cmpq $0, %rbx
+        jne bf_emit_cell_operand8
+        movw $0x2c04, (%r14)    #(%r12, %r13, 1)
+        addq $2, %r14
+        ret
+bf_emit_cell_operand8:
+        movsbq %bl, %rax
+        cmpq %rbx, %rax         #Does the offset fit in a signed byte?
+        jne bf_emit_cell_operand32
+        movw $0x2c44, (%r14)    #disp8(%r12, %r13, 1)
+        movb %bl, 2(%r14)
+        addq $3, %r14
+        ret
+bf_emit_cell_operand32:
+        movw $0x2c84, (%r14)    #disp32(%r12, %r13, 1)
+        movl %ebx, 2(%r14)
+        addq $6, %r14
         ret
 
 #Calls the SYS_READ syscall to read a single byte from STDIN
@@ -288,8 +419,8 @@ read_file:
         syscall
 
         pushq %rax              #Store file descriptor for later use
-        movq $64, %rdi
-        call malloc             #Allocate a 64 byte buffer for file stats
+        movq $144, %rdi
+        call malloc             #Allocate a 144 byte buffer for file stats
         popq %rdi               #Load the file descriptor into rdi
         pushq %rdi              #Store it again for later use
         pushq %rax              #Store the address of file stats for later use
