@@ -171,6 +171,118 @@ bf_yes:
         addq $3, %r13
         jmp bf_parse_loop
 bf_zero_pattern_end:
+bf_copy_pattern:
+        #A loop containing only +-<> that returns to its start cell and
+        #decrements that cell by exactly 1 per iteration runs cell[0] times,
+        #so it is compiled to cell[k] += d * cell[0] for each run of d at
+        #offset k, followed by cell[0] = 0
+        leaq 1(%r13), %rcx      #Scan index into the loop body
+        movq $0, %rdx           #Pointer offset relative to the loop start
+        movb $0, %al            #Net change of the start cell
+bf_copy_scan:
+        movb (%r12, %rcx, 1), %dil
+        cmpb $93, %dil          #Loop body ends at ]
+        je bf_copy_scan_end
+        cmpb $62, %dil          #>
+        jne bf_copy_scan_not_next
+        incq %rdx
+bf_copy_scan_not_next:
+        cmpb $60, %dil          #<
+        jne bf_copy_scan_not_prev
+        decq %rdx
+bf_copy_scan_not_prev:
+        cmpb $0, %dil           #Reject end of source, I/O and nested loops
+        je bf_copy_pattern_end
+        cmpb $46, %dil
+        je bf_copy_pattern_end
+        cmpb $44, %dil
+        je bf_copy_pattern_end
+        cmpb $91, %dil
+        je bf_copy_pattern_end
+        cmpq $0, %rdx           #Only track +/- on the start cell here
+        jne bf_copy_scan_next
+        cmpb $43, %dil          #+
+        jne bf_copy_scan_not_incr
+        incb %al
+bf_copy_scan_not_incr:
+        cmpb $45, %dil          #-
+        jne bf_copy_scan_next
+        decb %al
+bf_copy_scan_next:
+        incq %rcx
+        jmp bf_copy_scan
+bf_copy_scan_end:
+        cmpq $0, %rdx           #Must end on the start cell
+        jne bf_copy_pattern_end
+        cmpb $-1, %al           #Start cell must be decremented by exactly 1
+        jne bf_copy_pattern_end
+
+        movl $0x04B60F43, (%r14) #movzbl (%r12, %r13, 1), %eax
+        movb $0x2C, 4(%r14)
+        addq $5, %r14
+        leaq 1(%r13), %rcx      #Rescan the loop body to emit the updates
+        movq $0, %rdx
+        movb $0, %r8b           #Pending change at the current offset
+bf_copy_emit:
+        movb (%r12, %rcx, 1), %dil
+        cmpb $43, %dil          #+
+        jne bf_copy_emit_not_incr
+        incb %r8b
+bf_copy_emit_not_incr:
+        cmpb $45, %dil          #-
+        jne bf_copy_emit_not_decr
+        decb %r8b
+bf_copy_emit_not_decr:
+        cmpb $62, %dil          #Flush the pending change on >, < and ]
+        je bf_copy_flush
+        cmpb $60, %dil
+        je bf_copy_flush
+        cmpb $93, %dil
+        je bf_copy_flush
+        jmp bf_copy_emit_next
+bf_copy_flush:
+        cmpq $0, %rdx           #The start cell is zeroed at the end instead
+        je bf_copy_flushed
+        cmpb $0, %r8b
+        je bf_copy_flushed
+        cmpb $1, %r8b
+        jne bf_copy_flush_not_one
+        movq $0x2C840043, (%r14) #addb %al, offset(%r12, %r13, 1)
+        jmp bf_copy_flush_offset
+bf_copy_flush_not_one:
+        cmpb $-1, %r8b
+        jne bf_copy_flush_mul
+        movq $0x2C842843, (%r14) #subb %al, offset(%r12, %r13, 1)
+        jmp bf_copy_flush_offset
+bf_copy_flush_mul:
+        movq $0xC86B, (%r14)    #imull $change, %eax, %ecx
+        movb %r8b, 2(%r14)
+        addq $3, %r14
+        movq $0x2C8C0043, (%r14) #addb %cl, offset(%r12, %r13, 1)
+bf_copy_flush_offset:
+        movl %edx, 4(%r14)      #32-bit cell offset for the instruction above
+        addq $8, %r14
+bf_copy_flushed:
+        movb $0, %r8b
+        cmpb $62, %dil
+        jne bf_copy_emit_not_next
+        incq %rdx
+bf_copy_emit_not_next:
+        cmpb $60, %dil
+        jne bf_copy_emit_not_prev
+        decq %rdx
+bf_copy_emit_not_prev:
+        cmpb $93, %dil
+        je bf_copy_emit_end
+bf_copy_emit_next:
+        incq %rcx
+        jmp bf_copy_emit
+bf_copy_emit_end:
+        movq $0x002c04c643, (%r14) #movb $0, (%r12, %r13, 1)
+        addq $5, %r14
+        leaq 1(%rcx), %r13      #Continue after the ]
+        jmp bf_parse_loop
+bf_copy_pattern_end:
         pushq %r14
         movq $0x2C3C8043, (%r14) #cmpb $0, (%r12, %r13, 1)
         addq $5, %r14
