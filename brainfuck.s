@@ -288,7 +288,7 @@ read_file:
         syscall
 
         pushq %rax              #Store file descriptor for later use
-        movq $64, %rdi
+        movq $144, %rdi
         call malloc             #Allocate a 64 byte buffer for file stats
         popq %rdi               #Load the file descriptor into rdi
         pushq %rdi              #Store it again for later use
