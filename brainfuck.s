@@ -171,6 +171,8 @@ bf_yes:
         addq $3, %r13
         jmp bf_parse_loop
 bf_zero_pattern_end:
+        jmp bf_balanced_loop    #Try to turn a simple balanced loop into straight-line code
+bf_plain_loop:
         pushq %r14
         movq $0x2C3C8043, (%r14) #cmpb $0, (%r12, %r13, 1)
         addq $5, %r14
@@ -221,6 +223,146 @@ bf_prevnext_end:
         movq %r15, (%r14)               #Write actual immediate value
         addq $4, %r14
         jmp bf_parse_loop_switch
+
+## Balanced loop elimination
+## A loop whose body only contains + - < >, has a net pointer movement of zero
+## and decrements the cell at offset 0 by exactly 1 per iteration runs
+## cell[p] times, so for every touched offset k with net delta m it is
+## equivalent to: cell[p+k] += m * cell[p]; cell[p] = 0
+## Anything else falls back to bf_plain_loop.
+##
+## rsi: Source scan index
+## rdx: Current pointer offset relative to the loop start
+## rcx: Number of entries in the offset/delta table
+## r8b: Delta to add / delta being emitted
+## r9:  Table index
+.equ BAL_MAX, 64                #Maximum number of distinct offsets in a loop body
+.lcomm bal_offsets, 8 * BAL_MAX #Offset of each touched cell
+.lcomm bal_deltas, BAL_MAX      #Net delta per iteration of each touched cell
+bf_balanced_loop:
+        leaq 1(%r13), %rsi      #Start scanning after the [
+        xorq %rdx, %rdx
+        xorq %rcx, %rcx
+bf_bal_scan:
+        movb (%r12, %rsi, 1), %al #Fetch the next source character
+        cmpb $43, %al           #(+)
+        je bf_bal_incr
+        cmpb $45, %al           #(-)
+        je bf_bal_decr
+        cmpb $62, %al           #(>)
+        je bf_bal_next_addr
+        cmpb $60, %al           #(<)
+        je bf_bal_prev_addr
+        cmpb $93, %al           #(]) End of the loop body
+        je bf_bal_check
+        cmpb $91, %al           #Nested loops ([) are not handled
+        je bf_plain_loop
+        cmpb $46, %al           #Nor is I/O (. and ,)
+        je bf_plain_loop
+        cmpb $44, %al
+        je bf_plain_loop
+        cmpb $0, %al            #Unterminated loop
+        je bf_plain_loop
+bf_bal_next:                    #Anything else is a comment
+        incq %rsi
+        jmp bf_bal_scan
+bf_bal_next_addr:
+        incq %rdx
+        jmp bf_bal_next
+bf_bal_prev_addr:
+        decq %rdx
+        jmp bf_bal_next
+bf_bal_incr:
+        movb $1, %r8b
+        jmp bf_bal_add
+bf_bal_decr:
+        movb $-1, %r8b
+bf_bal_add:                     #Add r8b to the table entry for offset rdx
+        xorq %r9, %r9
+bf_bal_find:
+        cmpq %rcx, %r9
+        je bf_bal_new           #Not in the table yet
+        cmpq %rdx, bal_offsets(, %r9, 8)
+        je bf_bal_found
+        incq %r9
+        jmp bf_bal_find
+bf_bal_new:
+        cmpq $BAL_MAX, %rcx
+        je bf_plain_loop        #Too many distinct offsets
+        movq %rdx, bal_offsets(, %rcx, 8)
+        movb $0, bal_deltas(%rcx)
+        incq %rcx
+bf_bal_found:
+        addb %r8b, bal_deltas(%r9)
+        jmp bf_bal_next
+
+bf_bal_check:
+        cmpq $0, %rdx
+        jne bf_plain_loop       #Net pointer movement must be zero
+        xorq %r9, %r9
+bf_bal_find_counter:
+        cmpq %rcx, %r9
+        je bf_plain_loop        #Cell at offset 0 is never changed
+        cmpq $0, bal_offsets(, %r9, 8)
+        je bf_bal_found_counter
+        incq %r9
+        jmp bf_bal_find_counter
+bf_bal_found_counter:
+        cmpb $-1, bal_deltas(%r9)
+        jne bf_plain_loop       #Counter must be decremented by exactly 1
+
+        movl $0x2c048a43, (%r14) #movb (%r12, %r13, 1), %al
+        addq $4, %r14
+        xorq %r9, %r9
+bf_bal_emit:
+        cmpq %rcx, %r9
+        je bf_bal_emit_end
+        movq bal_offsets(, %r9, 8), %rdx
+        movb bal_deltas(%r9), %r8b
+        cmpq $0, %rdx
+        je bf_bal_emit_next     #The counter itself is zeroed at the end
+        cmpb $0, %r8b
+        je bf_bal_emit_next     #Net delta of zero, nothing to do
+        cmpb $1, %r8b
+        je bf_bal_emit_add
+        cmpb $-1, %r8b
+        je bf_bal_emit_sub
+        movw $0xc86b, (%r14)    #imul ${%r8b}, %eax, %ecx
+        movb %r8b, 2(%r14)
+        addq $3, %r14
+        movw $0x0043, (%r14)    #addb %cl, k(%r12, %r13, 1)
+        movb $0x0c, %al         #ModRM: reg=%cl, rm=SIB
+        jmp bf_bal_emit_mem
+bf_bal_emit_add:
+        movw $0x0043, (%r14)    #addb %al, k(%r12, %r13, 1)
+        movb $0x04, %al         #ModRM: reg=%al, rm=SIB
+        jmp bf_bal_emit_mem
+bf_bal_emit_sub:
+        movw $0x2843, (%r14)    #subb %al, k(%r12, %r13, 1)
+        movb $0x04, %al         #ModRM: reg=%al, rm=SIB
+bf_bal_emit_mem:
+        movb $0x2c, 3(%r14)     #SIB: (%r12, %r13, 1)
+        movsbq %dl, %r10
+        cmpq %rdx, %r10
+        jne bf_bal_emit_disp32  #Offset doesn't fit in a signed byte
+        orb $0x40, %al          #ModRM mod=01: disp8
+        movb %al, 2(%r14)
+        movb %dl, 4(%r14)
+        addq $5, %r14
+        jmp bf_bal_emit_next
+bf_bal_emit_disp32:
+        orb $0x80, %al          #ModRM mod=10: disp32
+        movb %al, 2(%r14)
+        movl %edx, 4(%r14)
+        addq $8, %r14
+bf_bal_emit_next:
+        incq %r9
+        jmp bf_bal_emit
+bf_bal_emit_end:
+        movq $0x002c04c643, (%r14) #movb $0, (%r12, %r13, 1)
+        addq $5, %r14
+        leaq 1(%rsi), %r13      #Continue parsing after the ]
+        jmp bf_parse_loop
 
 bf_parse_end:
         movq $0x5c415d41, (%r14) #popq %r13 - popq %r12
