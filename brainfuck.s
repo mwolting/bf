@@ -73,7 +73,7 @@ compile_brainfuck:
 
         ##Allocate a block of memory to emit code to
         movq $0, %rdi
-        shl $4, %rsi            #Allocate 8 bytes per character for instructions
+        shl $5, %rsi            #Allocate 32 bytes per character for instructions
         movq $3, %rdx         #PROT_READ | PROT_WRITE
         movq $0x22, %rcx
         movq $-1, %r8
